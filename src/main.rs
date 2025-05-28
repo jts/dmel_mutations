@@ -13,6 +13,9 @@ use bio::alphabets::dna;
 use csv::ReaderBuilder;
 use rand::Rng;
 use itertools::Itertools;
+use petgraph::{Graph};
+use petgraph::algo::connected_components;
+use petgraph::prelude::*;
 
 mod pileup_stats;
 mod annotation;
@@ -80,6 +83,12 @@ fn main() {
                     .required(true)
                     .takes_value(true)
                     .help("the sites to use to calculate APOBEC genotype"))
+                .arg(Arg::with_name("annotation")
+                    .short("a")
+                    .long("annotation")
+                    .required(true)
+                    .takes_value(true)
+                    .help("annotation VCF"))
                 .arg(Arg::with_name("output-style")
                     .short("o")
                     .long("output-style")
@@ -116,6 +125,12 @@ fn main() {
                     .required(true)
                     .index(1)
                     .help("the input fasta file to process")))
+        .subcommand(SubCommand::with_name("collapse-reads")
+                .about("compute statistics about read similarity")
+                .arg(Arg::with_name("input-tsv")
+                    .required(true)
+                    .index(1)
+                    .help("tsv file containing read-read distances")))
         .subcommand(SubCommand::with_name("process-vcf")
                 .about("convert VEP's VCF format to a more usable format")
                 .arg(Arg::with_name("input-bam")
@@ -147,6 +162,7 @@ fn main() {
         read_to_matrix(matches.value_of("input-bam").unwrap(), 
                        matches.value_of("genome").unwrap(), 
                        matches.value_of("sites").unwrap(), 
+                       matches.value_of("annotation").unwrap(), 
                        matches.value_of("output-style").unwrap_or("string"),
                        max_reads);
     }
@@ -162,6 +178,11 @@ fn main() {
     if let Some(matches) = matches.subcommand_matches("process-vcf") {
         process_vcf(matches.value_of("input-vcf").unwrap(), matches.value_of("input-bam").unwrap());
     }
+
+    if let Some(matches) = matches.subcommand_matches("collapse-reads") {
+        collapse_reads(matches.value_of("input-tsv").unwrap());
+    }
+
 }
 
 pub fn get_chromosome_sequence(reference_genome: &str,
@@ -404,7 +425,8 @@ fn calculate_run_statistics(input_bam: &str) {
 
 }
 
-fn read_to_matrix(input_bam: &str, reference_genome: &str, typing_path: &str, output_format: &str, max_reads: usize) {
+fn read_to_matrix(input_bam: &str, reference_genome: &str, typing_path: &str, annotation_vcf: &str, output_format: &str, max_reads: usize) {
+    let annotation = MitoAnnotation::from_vcf(annotation_vcf);
     let mut bam = bam::IndexedReader::from_path(input_bam).expect("Could not read input bam file:");
     let header_view = bam.header().clone();
 
@@ -417,12 +439,13 @@ fn read_to_matrix(input_bam: &str, reference_genome: &str, typing_path: &str, ou
     let mut idx = 0;
     for result in rdr.records() {
         let record = result.unwrap();
-        let position = record.get(1).unwrap().parse::<usize>().unwrap();
+        let position = record.get(1).unwrap().parse::<usize>().unwrap() - 1; // 0-based
         typing_map.insert(position, idx);
         typing_positions.push(position);
         idx += 1;
     }
     
+    let max_N_rate = 0.01;
     let min_base_quality = 20.0;
 
     let chromosome_name = "chrM";
@@ -435,7 +458,7 @@ fn read_to_matrix(input_bam: &str, reference_genome: &str, typing_path: &str, ou
     if output_format == "string" {
         println!("read_idx\tread_name\tchromosome\talleles");
     } else {
-        println!("read_idx\tread_name\tchromosome\tposition\tallele");
+        println!("read_idx\tread_name\tchromosome\tposition\tsite_idx\tallele\tcsq");
     }
 
     for r in bam.records() {
@@ -447,6 +470,8 @@ fn read_to_matrix(input_bam: &str, reference_genome: &str, typing_path: &str, ou
         }
 
         let mut apobec_type = vec![b'N'; typing_map.len()];
+        let mut positions = vec![0; typing_map.len()];
+        let mut apobec_csq = vec![String::from("unknown"); typing_map.len()];
         for ap in record.aligned_pairs() {
             
             let qpos = ap[0];
@@ -467,24 +492,35 @@ fn read_to_matrix(input_bam: &str, reference_genome: &str, typing_path: &str, ou
                     'A' as u8
                 };
 
-                if read_base == ref_base || read_base == mutated_base {
-                    let is_match = (read_base == ref_base) as usize;
-
-                    if let Some(type_idx) = typing_map.get( &(rpos as usize) ) {
+                if let Some(type_idx) = typing_map.get( &(rpos as usize) ) {
+                    let rpos1 = rpos + 1; // 1-based coord for lookup
+                    apobec_csq[*type_idx as usize] = annotation.get_class(rpos1 as usize);
+                    positions[*type_idx as usize] = rpos1;
+                    if read_base == ref_base || read_base == mutated_base {
+                        let is_match = (read_base == ref_base) as usize;
                         apobec_type[*type_idx as usize] = (1 - is_match) as u8 + 48;
                     }
+                } else {
+                    println!("{rpos} not in map")
                 }
             }
         }
 
         let qname = std::str::from_utf8(record.qname()).unwrap();
-        
+        let mut num_N = 0;
+        for idx in 0..apobec_type.len() {
+            if apobec_type[idx] == b'N' { num_N += 1; }
+        }
+
+        // skip reads with a lot of missing sites
+        if num_N as f64 / apobec_type.len() as f64 > max_N_rate { continue; }
+
         if output_format == "string" {
             let apobec_str = apobec_type.iter().map(|x| (*x as char).to_string()).collect::<Vec<String>>().join("");
             println!("{}\t{}\t{}\t{}", read_idx, qname, contig, apobec_str);
         } else {
             for idx in 0..apobec_type.len() {
-              println!("{}\t{}\t{}\t{}\t{}", read_idx, qname, contig, idx, apobec_type[idx] as char);
+              println!("{}\t{}\t{}\t{}\t{}\t{}\t{}", read_idx, qname, contig, positions[idx], idx, apobec_type[idx] as char, apobec_csq[idx]);
             }
         }
         
@@ -520,7 +556,6 @@ fn apobec_edit_distance(read_matrix_tsv: &str, from: &str) {
             pairs.push( (an.clone(), bn.clone()) );
         }
     } else if from == "allpairs" {
-        n = 500;
         for i in 0..n {
             for j in (i+1)..n {
                 pairs.push( (read_names[i].clone(), read_names[j].clone()) );
@@ -655,3 +690,29 @@ fn process_vcf(vcf: &str, bam: &str) {
     }
 }
 
+fn collapse_reads(tsv: &str) {
+    println!("max_edit_distance\tgraph_nodes\tgraph_edges\tclusters");
+    for max_ed in 0..25 {
+        let matrix_file = File::open(tsv).unwrap();
+        let mut rdr = ReaderBuilder::new()
+                           .delimiter(b'\t')
+                           .from_reader(matrix_file);
+        
+        let mut rn_to_node : HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
+        let mut graph : Graph<String, (), Undirected> = Graph::new_undirected();
+
+        for result in rdr.records() {
+            let record = result.unwrap();
+            let name1 = record.get(0).unwrap().parse::<String>().unwrap();
+            let name2 = record.get(1).unwrap().parse::<String>().unwrap();
+            let distance = record.get(3).unwrap().parse::<usize>().unwrap();
+
+            let node1 = rn_to_node.entry( name1 ).or_insert_with_key( |key| { graph.add_node(key.clone()) } ).clone();
+            let node2 = rn_to_node.entry( name2 ).or_insert_with_key( |key| { graph.add_node(key.clone()) } ).clone();
+            if distance <= max_ed {
+                graph.add_edge(node1, node2, ());
+            }
+        }
+        println!("{max_ed}\t{}\t{}\t{}", graph.node_count(), graph.edge_count(), connected_components(&graph));
+    }
+}
